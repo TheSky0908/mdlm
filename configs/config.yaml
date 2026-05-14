@@ -12,8 +12,17 @@ diffusion: absorbing_state
 backbone: dit  # dit / dimamba / ar
 parameterization: subs  # subs / d3pm / sedd
 time_conditioning: False
-T: 0  # 0 (continuous time) / 1000 
+T: 0  # 0 (continuous time) / 1000
 subs_masking: False
+
+
+###claude modified
+remove_mask_pred: False
+mask_ratio_conditioning: False
+self_conditioning: False
+ratio_training: False
+ratio_is: False
+###end of claude modified
 
 seed: 1
 
