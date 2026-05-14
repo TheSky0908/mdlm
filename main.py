@@ -12,6 +12,12 @@ import dataloader
 import diffusion
 import utils
 
+## Claude modefied
+import constraints as constraint_lib
+import discriminator as disc_lib
+import fhs_constrained
+## end of Claude modifications
+
 omegaconf.OmegaConf.register_new_resolver(
   'cwd', os.getcwd)
 omegaconf.OmegaConf.register_new_resolver(
@@ -183,6 +189,86 @@ def _train(config, logger, tokenizer):
   trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
 
 
+def _train_discriminator(config, logger, tokenizer):
+  """Train the h_φ discriminator with BCE loss."""
+  logger.info('Training discriminator h_phi.')
+
+  model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
+  model.eval()
+
+  constraint = constraint_lib.build_constraint(config, tokenizer, model.mask_index)
+  if constraint is None:
+    raise ValueError('discriminator_train mode requires a constraint in config.')
+
+  train_ds, _ = dataloader.get_dataloaders(config, tokenizer)
+
+  disc = disc_lib.HDiscriminator(
+    vocab_size=model.vocab_size,
+    hidden_size=getattr(config.discriminator, 'hidden_size', 256),
+    num_layers=getattr(config.discriminator, 'num_layers', 4),
+    num_heads=getattr(config.discriminator, 'num_heads', 4),
+    max_length=getattr(config.discriminator, 'max_length', 1024),
+    dropout=getattr(config.discriminator, 'dropout', 0.1),
+  )
+
+  save_path = getattr(config.discriminator, 'save_path', 'discriminator.pt')
+  disc_lib.train_discriminator(
+    discriminator=disc,
+    diffusion=model,
+    constraint=constraint,
+    train_dataloader=train_ds,
+    config=config,
+    device=model.device,
+    save_path=save_path,
+  )
+
+
+def _constrained_sample_eval(config, logger, tokenizer):
+  """Generate samples under hard constraint using FHS."""
+  logger.info('Constrained FHS sampling.')
+
+  model = _load_from_checkpoint(config=config, tokenizer=tokenizer)
+  if config.eval.disable_ema:
+    model.ema = None
+
+  constraint = constraint_lib.build_constraint(config, tokenizer, model.mask_index)
+
+  # Optionally load a pre-trained discriminator
+  disc = None
+  disc_path = getattr(config, 'discriminator', None)
+  if disc_path is not None:
+    disc_path = getattr(config.discriminator, 'load_path', None)
+  if disc_path is not None and disc_path != '':
+    disc = disc_lib.load_discriminator(disc_path, config, model.vocab_size)
+    disc = disc.to(model.device).eval()
+    logger.info(f'Loaded discriminator from {disc_path}')
+
+  topk = getattr(getattr(config, 'discriminator', object()), 'topk', 50)
+
+  all_samples = []
+  for _ in range(config.sampling.num_sample_batches):
+    samples = fhs_constrained.restore_and_sample_constrained(
+      diffusion=model,
+      num_steps=config.sampling.steps,
+      constraint=constraint,
+      discriminator=disc,
+      topk=topk,
+    )
+    texts = model.tokenizer.batch_decode(samples)
+    all_samples.extend(texts)
+
+  print('Constrained samples:')
+  for t in all_samples[:config.sampling.num_sample_log]:
+    print(' ', t)
+
+  if constraint is not None:
+    ids = model.tokenizer(all_samples, return_tensors='pt',
+                          padding=True, truncation=True,
+                          max_length=config.model.length).input_ids
+    sat = constraint.check(ids).float().mean().item()
+    print(f'Constraint satisfaction rate: {sat:.3f}')
+
+
 @hydra.main(version_base=None, config_path='configs',
             config_name='config')
 def main(config):
@@ -197,6 +283,10 @@ def main(config):
     generate_samples(config, logger, tokenizer)
   elif config.mode == 'ppl_eval':
     _ppl_eval(config, logger, tokenizer)
+  elif config.mode == 'discriminator_train':
+    _train_discriminator(config, logger, tokenizer)
+  elif config.mode == 'constrained_sample_eval':
+    _constrained_sample_eval(config, logger, tokenizer)
   else:
     _train(config, logger, tokenizer)
 

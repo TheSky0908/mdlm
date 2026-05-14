@@ -1,0 +1,7 @@
+# Hard banned-words constraint: none of the listed words may appear in the output.
+# Tokens are resolved via the tokenizer, so multi-token words are handled correctly.
+type: banned_words
+banned_words:
+  - "violence"
+  - "hate"
+  - "kill"

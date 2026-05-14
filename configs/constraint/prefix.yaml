@@ -1,0 +1,4 @@
+# Hard prefix constraint: every generated sequence must begin with `prefix_text`.
+# Example: prefix_text: "The study of"
+type: prefix
+prefix_text: "The"

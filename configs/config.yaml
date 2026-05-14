@@ -6,6 +6,7 @@ defaults:
   - /strategy: ddp
   - /noise: loglinear
   - /lr_scheduler: constant_warmup
+  - /constraint: none
 
 mode: train  # train / ppl_eval / sample_eval
 diffusion: absorbing_state
@@ -109,3 +110,18 @@ checkpointing:
   # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt
+
+# Discriminator h_phi settings (used for discriminator_train and constrained_sample_eval modes)
+discriminator:
+  hidden_size: 256
+  num_layers: 4
+  num_heads: 4
+  max_length: 1024
+  dropout: 0.1
+  lr: 3e-4
+  weight_decay: 0.0
+  max_steps: 10000
+  log_every: 100
+  topk: 50            # top-K candidates per masked position during sampling
+  save_path: discriminator.pt
+  load_path: ''        # set to load a pre-trained discriminator
