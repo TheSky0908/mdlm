@@ -22,6 +22,7 @@ mask_ratio_conditioning: False
 self_conditioning: False
 ratio_training: False
 ratio_is: False
+temperature: 1.0
 ###end of claude modified
 
 seed: 1
