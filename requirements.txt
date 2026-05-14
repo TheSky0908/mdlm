@@ -20,4 +20,4 @@ timm==0.9.16
 transformers==4.38.2
 triton==2.2.0
 wandb==0.13.5
-flash-attn==2.5.6
+#flash-attn==2.5.6
