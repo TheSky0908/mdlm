@@ -249,7 +249,6 @@ def _constrained_sample_eval(config, logger, tokenizer):
   for _ in range(config.sampling.num_sample_batches):
     samples = fhs_constrained.restore_and_sample_constrained(
       diffusion=model,
-      num_steps=config.sampling.steps,
       constraint=constraint,
       discriminator=disc,
       topk=topk,

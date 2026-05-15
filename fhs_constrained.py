@@ -1,25 +1,26 @@
 """
-Hard-constrained FHS sampling for masked discrete diffusion (Case 2).
+Hard-constrained FHS (First Hitting Sampler) for masked discrete diffusion.
 
-Theory recap (from the derivation notes):
-    Let C be a constraint set.  Define the cost c(x) = 0 if x∈C, +∞ otherwise.
+Theory (Case 2 from the notes):
+    h_t(x) = P(X_0 ∈ C | X_t = x)   ← 判别器目标
 
-    h_t(x) = P(X_0 ∈ C | X_t = x)          ← discriminator target
+FHS constrained 的三步流程（与原始 FHS 完全对齐，仅第三步加 h 矫正）：
 
-    The constrained rate matrix (Doob h-transform):
-        Q_t^λ(x,y) = Q_t(x,y) · h_t(y) / h_t(x)
+  Step 1  更新时间
+            u  ~ Uniform[0,1]^{1/num_masked}   (order statistic trick)
+            s  = u * t
 
-    In the FHS setting the next-token distribution becomes:
-        P(a | x, τ, i) ∝ μ^i(a|x,t) · h_t(x^{-i}⊕a)
+  Step 2  选 unmask 位置
+            selected_index ~ Uniform(masked positions in x)
 
-    where μ^i(a|x,t) is the diffusion model's predicted token probability
-    and x^{-i}⊕a is x with position i replaced by token a.
+  Step 3  预测 token（加 h 矫正）
+            原始 FHS:  P(a | x, s, i) ∝ μ^i(a | x, s)
+            Constrained:  P(a | x, s, i) ∝ μ^i(a | x, s) · h_s(x^{-i}⊕a)
 
-Two constraint backends are supported:
-  1. Analytical (PrefixConstraint, BannedTokensConstraint): additive -inf mask
-     applied to log p_x0.  Exact and fast – no extra neural network needed.
-  2. Neural discriminator h_φ: for each masked position, top-K candidates are
-     scored by h_φ(x^{-i}⊕a, t) and used to reweight the model distribution.
+其中 μ^i(a|x,s) = p_x0[b, selected_index, a]（扩散模型的输出）。
+h_s(x^{-i}⊕a) 通过以下两种方式之一计算：
+  - 解析约束（PrefixConstraint / BannedTokensConstraint）：直接对 token 分布置零
+  - 神经判别器 h_φ：对 top-K 候选 token 逐一评估 h_φ(x^{-i}⊕a, s)
 """
 from __future__ import annotations
 
@@ -31,134 +32,76 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from diffusion import _sample_categorical   # reuse existing helper
+from diffusion import _sample_categorical
 
 
 # ---------------------------------------------------------------------------
-# Core reweighting step
+# Step 3 的 h 矫正
 # ---------------------------------------------------------------------------
 
-def apply_constraint_to_p_x0(
-    p_x0: Tensor,
-    x: Tensor,
-    t_scalar: Tensor,
-    mask_index: int,
+def _apply_h_to_position(
+    q_xs: Tensor,           # [B, V]  当前位置的 token 分布（已去掉 mask token）
+    x: Tensor,              # [B, L]  当前含噪序列
+    selected_index: Tensor, # [B]     本轮要 unmask 的位置
+    t: Tensor,              # [B]     当前时间
     constraint,
     discriminator: Optional[nn.Module],
-    topk: int = 50,
+    topk: int,
 ) -> Tensor:
     """
-    Reweight p_x0 to encode the hard constraint h_t(x^{-i}⊕a).
+    对选中位置的 token 分布应用约束矫正：
+        P(a | x, s, i) ∝ q_xs[a] · h_s(x^{-i}⊕a)
 
-    Args:
-        p_x0:       [B, L, V] probabilities from the diffusion model
-        x:          [B, L]    current noisy token ids
-        t_scalar:   [B]       time values in [0, 1]
-        mask_index: int       id of the [MASK] token
-        constraint:           BaseConstraint with .logits_mask(), or None
-        discriminator:        HDiscriminator, or None
-        topk:       int       number of candidates to evaluate per position
-                              when using the neural discriminator
-
-    Returns:
-        [B, L, V] reweighted probability tensor (sums to 1 over V)
+    返回归一化后的 [B, V] 分布。
     """
-    # --- (a) Analytical constraint: additive -inf mask in log-space ----------
+    B, V = q_xs.shape
+
+    # --- 解析约束：直接对 q_xs 置零 ---
     if constraint is not None and hasattr(constraint, "logits_mask"):
-        log_p = p_x0.clamp(min=1e-30).log()
-        log_p = log_p + constraint.logits_mask(x, log_p)
-        # Safe re-normalisation (some rows might be all -inf at the mask token)
-        lse = torch.logsumexp(log_p, dim=-1, keepdim=True)
-        log_p = log_p - lse
-        p_x0 = log_p.exp()
+        # 为每个 batch 项构造一个"只有选中位置有效"的假 p_x0，
+        # 借用 logits_mask 接口取出该位置的 mask 向量。
+        # logits_mask 返回 [B, L, V]，我们只取 selected_index 那行。
+        dummy_log_p = q_xs.log().unsqueeze(1).expand(B, x.shape[1], V)  # [B, L, V]
+        additive_mask = constraint.logits_mask(x, dummy_log_p)           # [B, L, V]
 
-    # --- (b) Neural discriminator: h_φ(x^{-i}⊕a, t) reweighting ------------
+        # 取每个 batch 对应选中位置的那行
+        pos_mask = additive_mask[
+            torch.arange(B, device=x.device), selected_index
+        ]  # [B, V]
+
+        log_q = q_xs.clamp(min=1e-30).log() + pos_mask
+        # 重新归一化（有些 token 被置为 -inf）
+        log_q = log_q - torch.logsumexp(log_q, dim=-1, keepdim=True)
+        q_xs = log_q.exp()
+
+    # --- 神经判别器：top-K 候选的 h 矫正 ---
     if discriminator is not None:
-        B, L, V = p_x0.shape
-        p_x0 = p_x0.clone()
-
+        q_xs = q_xs.clone()
         for b in range(B):
-            masked_pos = (x[b] == mask_index).nonzero(as_tuple=False).squeeze(1)
-            if masked_pos.numel() == 0:
-                continue
+            k = min(topk, V)
+            top_probs, top_ids = q_xs[b].topk(k)   # [K]
 
-            for pos in masked_pos.tolist():
-                k = min(topk, V)
-                top_probs, top_ids = p_x0[b, pos].topk(k)  # [K]
+            # 构造 K 条序列，每条在 selected_index[b] 位置换成不同 token
+            pos = selected_index[b].item()
+            x_cands = x[b].unsqueeze(0).expand(k, -1).clone()  # [K, L]
+            x_cands[:, pos] = top_ids
+            t_cands = t[b:b+1].expand(k)                        # [K]
 
-                # Create K sequences each with a different token at `pos`
-                x_cands = x[b].unsqueeze(0).expand(k, -1).clone()  # [K, L]
-                x_cands[:, pos] = top_ids
-                t_cands = t_scalar[b:b+1].expand(k)               # [K]
+            with torch.no_grad():
+                h_scores = discriminator(x_cands, t_cands)      # [K] ∈ (0,1)
 
-                with torch.no_grad():
-                    h_scores = discriminator(x_cands, t_cands)     # [K] ∈ (0,1)
+            weighted = top_probs * (h_scores + 1e-8)
+            weighted = weighted / (weighted.sum() + 1e-30)
 
-                # P(a|x,τ,i) ∝ μ^i(a|x,t) · h_t(x^{-i}⊕a)
-                weighted = top_probs * (h_scores + 1e-8)
-                weighted = weighted / (weighted.sum() + 1e-30)
+            new_row = torch.zeros(V, device=q_xs.device)
+            new_row.scatter_(0, top_ids, weighted)
+            q_xs[b] = new_row
 
-                new_row = torch.zeros(V, device=p_x0.device)
-                new_row.scatter_(0, top_ids, weighted)
-                p_x0[b, pos] = new_row
-
-    return p_x0
+    return q_xs
 
 
 # ---------------------------------------------------------------------------
-# Single denoising step
-# ---------------------------------------------------------------------------
-
-def ddpm_caching_step_constrained(
-    diffusion,
-    x: Tensor,
-    t: Tensor,
-    dt: float,
-    constraint,
-    discriminator: Optional[nn.Module],
-    p_x0_cache: Optional[Tensor],
-    topk: int = 50,
-):
-    """
-    One constrained DDPM-cache denoising step.
-
-    Returns (p_x0, x_next) mirroring the signature of _ddpm_caching_update.
-    """
-    assert diffusion.config.noise.type == "loglinear"
-    sigma_t, _ = diffusion.noise(t)
-    t_1d = t.squeeze(-1) if t.ndim > 1 else t   # [B]
-    assert t_1d.ndim == 1
-
-    move_chance_t = t_1d[:, None, None]
-    move_chance_s = (t_1d - dt)[:, None, None]
-
-    if p_x0_cache is None:
-        p_x0 = diffusion.forward(x, sigma_t).exp()   # [B, L, V]
-    else:
-        p_x0 = p_x0_cache
-
-    # Reweight by constraint / discriminator
-    p_x0 = apply_constraint_to_p_x0(
-        p_x0, x, t_1d,
-        mask_index=diffusion.mask_index,
-        constraint=constraint,
-        discriminator=discriminator,
-        topk=topk,
-    )
-
-    # Standard DDPM-cache transition q(x_s | x_t, x_0)
-    q_xs = p_x0 * (move_chance_t - move_chance_s)
-    q_xs[:, :, diffusion.mask_index] = move_chance_s[:, :, 0]
-    x_next_candidate = _sample_categorical(q_xs)
-
-    copy_flag = (x != diffusion.mask_index).to(x.dtype)
-    x_next = copy_flag * x + (1 - copy_flag) * x_next_candidate
-
-    return p_x0, x_next
-
-
-# ---------------------------------------------------------------------------
-# Full constrained sampling loop
+# 完整 FHS constrained 采样循环
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -166,87 +109,78 @@ def sample_fhs_constrained(
     diffusion,
     constraint,
     discriminator: Optional[nn.Module],
-    num_steps: Optional[int] = None,
-    eps: float = 1e-5,
     topk: int = 50,
 ) -> Tensor:
     """
-    Full constrained FHS sampling from all-mask initial condition.
+    FHS constrained 采样，与原始 restore_model_and_sample_first_hitting 流程完全对齐。
 
-    Each denoising step applies the h_t reweighting so that the reverse
-    process gradually concentrates mass on sequences in C.
-
-    Args:
-        diffusion:      Diffusion LightningModule (loaded, in eval mode)
-        constraint:     BaseConstraint or None (analytical fast path)
-        discriminator:  HDiscriminator or None
-        num_steps:      number of denoising steps (default: config value)
-        eps:            minimum time (avoids t=0 numerical issues)
-        topk:           top-K vocab candidates when using discriminator
-
-    Returns:
-        x: [B, L] sampled token ids
+    每轮迭代：
+      1. 更新时间  t → s
+      2. 选 unmask 位置  selected_index
+      3. 用扩散模型预测 token 分布，乘以 h 矫正项后采样
     """
     batch_size = diffusion.config.loader.eval_batch_size
-    if num_steps is None:
-        num_steps = diffusion.config.sampling.steps
+    L = diffusion.config.model.length
+    device = diffusion.device
 
-    x = diffusion._sample_prior(batch_size, diffusion.config.model.length).to(
-        diffusion.device
-    )
-    timesteps = torch.linspace(1, eps, num_steps + 1, device=diffusion.device)
-    dt = (1 - eps) / num_steps
-    p_x0_cache = None
+    x = diffusion._sample_prior(batch_size, L).to(device)   # 全 MASK 初始化
+    B = x.shape[0]
+    t = torch.ones(B, device=device)                         # t=1 对应全 MASK
 
-    for i in range(num_steps):
-        t = timesteps[i] * torch.ones(x.shape[0], 1, device=diffusion.device)
-        p_x0_cache, x_next = ddpm_caching_step_constrained(
-            diffusion, x, t, dt,
+    for i in range(L):
+        num_masked = L - i
+
+        # ---- Step 1: 更新时间 ----
+        # u ~ max of num_masked uniform draws = U^{1/num_masked}
+        u = torch.float_power(torch.rand_like(t), 1.0 / num_masked)
+        s = (u * t).to(t.dtype)
+        sigma_s, _ = diffusion.noise(s)
+
+        # ---- Step 2: 选 unmask 位置 ----
+        coord = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)  # [B, L]
+        masked_indices = torch.masked_select(
+            coord, x == diffusion.mask_index
+        ).reshape(B, num_masked)                                            # [B, num_masked]
+
+        rand_pos = torch.randint(high=num_masked, size=(B,), device=device)
+        selected_index = masked_indices[torch.arange(B, device=device), rand_pos]  # [B]
+
+        # ---- Step 3: 预测 token 分布 + h 矫正 ----
+        p_x0 = diffusion.forward(x, sigma_s).exp()          # [B, L, V]
+        p_x0[:, :, diffusion.mask_index] = 0
+        p_x0 = p_x0 / p_x0.sum(dim=-1, keepdim=True)
+
+        # 取出选中位置的 token 分布  μ^i(a|x,s)
+        q_xs = p_x0[torch.arange(B, device=device), selected_index]  # [B, V]
+
+        # 乘以 h_s(x^{-i}⊕a)
+        q_xs = _apply_h_to_position(
+            q_xs, x, selected_index, s,
             constraint=constraint,
             discriminator=discriminator,
-            p_x0_cache=p_x0_cache,
             topk=topk,
         )
-        if not torch.allclose(x_next, x):
-            p_x0_cache = None
-        x = x_next
 
-    # Final argmax denoising with constraint enforced
-    if diffusion.config.sampling.noise_removal:
-        t_final = timesteps[-1] * torch.ones(x.shape[0], 1, device=diffusion.device)
-        sigma_final = diffusion.noise(t_final)[0]
-        p_x0_final = diffusion.forward(x, sigma_final).exp()
-        p_x0_final = apply_constraint_to_p_x0(
-            p_x0_final,
-            x,
-            timesteps[-1].expand(x.shape[0]),
-            mask_index=diffusion.mask_index,
-            constraint=constraint,
-            discriminator=discriminator,
-            topk=topk,
-        )
-        x = p_x0_final.argmax(dim=-1)
+        # 采样并写回
+        token = _sample_categorical(q_xs)                    # [B]
+        x[torch.arange(B, device=device), selected_index] = token
+
+        t = s
 
     return x
 
 
 # ---------------------------------------------------------------------------
-# Public entry-point (wraps EMA store/restore around sampling)
+# 公共入口（带 EMA store/restore）
 # ---------------------------------------------------------------------------
 
 def restore_and_sample_constrained(
     diffusion,
-    num_steps: int,
     constraint=None,
     discriminator: Optional[nn.Module] = None,
-    eps: float = 1e-5,
     topk: int = 50,
 ) -> Tensor:
-    """
-    Load EMA weights, run constrained FHS sampling, restore weights.
-
-    This mirrors diffusion.restore_model_and_sample() but with constraint.
-    """
+    """加载 EMA 权重 → 约束 FHS 采样 → 还原权重。"""
     if diffusion.ema:
         diffusion.ema.store(
             itertools.chain(
@@ -266,14 +200,15 @@ def restore_and_sample_constrained(
         diffusion,
         constraint=constraint,
         discriminator=discriminator,
-        num_steps=num_steps,
-        eps=eps,
         topk=topk,
     )
-    print(f"[FHS-Constrained] elapsed={time.time()-t0:.2f}s  "
-          f"constraint_sat={constraint.check(samples).float().mean().item():.3f}"
-          if constraint is not None else
-          f"[FHS-Constrained] elapsed={time.time()-t0:.2f}s")
+    elapsed = time.time() - t0
+
+    if constraint is not None:
+        sat = constraint.check(samples).float().mean().item()
+        print(f"[FHS-Constrained] elapsed={elapsed:.2f}s  constraint_sat={sat:.3f}")
+    else:
+        print(f"[FHS-Constrained] elapsed={elapsed:.2f}s")
 
     if diffusion.ema:
         diffusion.ema.restore(
