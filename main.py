@@ -239,12 +239,19 @@ def _constrained_sample_eval(config, logger, tokenizer):
   if disc_path is not None:
     disc_path = getattr(config.discriminator, 'load_path', None)
   if disc_path is not None and disc_path != '':
-    disc = disc_lib.load_discriminator(disc_path, config, model.vocab_size)
-    disc = disc.to(model.device).eval()
-    logger.info(f'Loaded discriminator from {disc_path}')
+    if not os.path.exists(disc_path):
+      logger.warning(
+        f'Discriminator file not found: {disc_path}. '
+        f'Falling back to analytical constraint only.'
+      )
+    else:
+      disc = disc_lib.load_discriminator(disc_path, config, model.vocab_size)
+      disc = disc.to(model.device).eval()
+      logger.info(f'Loaded discriminator from {disc_path}')
 
   topk = getattr(getattr(config, 'discriminator', object()), 'topk', 50)
 
+  model.gen_ppl_metric.reset()
   all_samples = []
   for _ in range(config.sampling.num_sample_batches):
     samples = fhs_constrained.restore_and_sample_constrained(
@@ -255,10 +262,13 @@ def _constrained_sample_eval(config, logger, tokenizer):
     )
     texts = model.tokenizer.batch_decode(samples)
     all_samples.extend(texts)
+    model.compute_generative_perplexity(texts)
 
   print('Constrained samples:')
   for t in all_samples[:config.sampling.num_sample_log]:
     print(' ', t)
+
+  print(f'Generative perplexity: {model.gen_ppl_metric.compute():.3f}')
 
   if constraint is not None:
     ids = model.tokenizer(all_samples, return_tensors='pt',
