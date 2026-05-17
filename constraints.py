@@ -19,18 +19,10 @@ class BaseConstraint:
         """Return bool tensor [B]: True iff sequence satisfies constraint."""
         raise NotImplementedError
 
-    def logits_mask(self, x: Tensor, p_x0: Tensor) -> Tensor:
-        """
-        Additive log-mask applied to p_x0 before softmax.
-
-        Args:
-            x:     [B, L] current noisy token ids
-            p_x0:  [B, L, V] log-probabilities from diffusion model
-
-        Returns:
-            mask:  [B, L, V] – 0 where allowed, -inf where forbidden
-        """
-        raise NotImplementedError
+    # logits_mask 不在基类定义：只有解析约束（Prefix / BannedTokens）才实现它。
+    # fhs_constrained.py 用 hasattr(constraint, "logits_mask") 来区分两条路径：
+    #   有 logits_mask → 解析快速路径
+    #   没有           → 必须配合神经判别器使用
 
 
 class PrefixConstraint(BaseConstraint):
