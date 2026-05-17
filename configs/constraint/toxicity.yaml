@@ -1,0 +1,4 @@
+type: toxicity
+classifier_name: "unitary/toxic-bert"
+threshold: 0.5          # 生成文本 toxicity score 低于此值才算满足约束
+classifier_device: "cpu" # 避免与扩散模型争 GPU；如 GPU 显存够可改为 "cuda"

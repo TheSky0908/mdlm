@@ -85,6 +85,64 @@ class BannedTokensConstraint(BaseConstraint):
         return mask
 
 
+class ToxicityConstraint(BaseConstraint):
+    """
+    Soft-turned-hard toxicity constraint: C = {x : toxicity(x) < threshold}.
+
+    Uses a pre-trained classifier (default: unitary/toxic-bert) as the oracle
+    to label clean sequences.  No logits_mask — toxicity cannot be enforced
+    analytically, so this constraint must be paired with a neural discriminator
+    h_φ during FHS sampling.
+
+    The classifier is only needed at training time (to generate BCE labels for
+    h_φ).  At sampling time only h_φ is queried.
+    """
+
+    TOXIC_LABEL = "toxic"
+
+    def __init__(
+        self,
+        diffusion_tokenizer,
+        classifier_name: str = "unitary/toxic-bert",
+        threshold: float = 0.5,
+        device: str = "cpu",
+    ):
+        import transformers
+
+        self.diffusion_tokenizer = diffusion_tokenizer
+        self.threshold = threshold
+
+        # Pipeline runs on its own device; keep it on CPU by default to avoid
+        # competing with the diffusion model for GPU memory.
+        self.pipeline = transformers.pipeline(
+            "text-classification",
+            model=classifier_name,
+            device=device,
+            truncation=True,
+            max_length=512,
+        )
+
+    @torch.no_grad()
+    def check(self, x: Tensor) -> Tensor:
+        """
+        Decode token ids → text, run toxicity classifier, return bool [B].
+        True  = non-toxic (satisfies constraint).
+        False = toxic    (violates constraint).
+        """
+        texts = self.diffusion_tokenizer.batch_decode(
+            x, skip_special_tokens=True
+        )
+        results = self.pipeline(texts)
+        satisfies = []
+        for r in results:
+            label = r["label"].lower()
+            score = r["score"]
+            # pipeline returns the winning label with its probability
+            tox_score = score if label == self.TOXIC_LABEL else 1.0 - score
+            satisfies.append(tox_score < self.threshold)
+        return torch.tensor(satisfies, dtype=torch.bool, device=x.device)
+
+
 class ComposedConstraint(BaseConstraint):
     """AND composition of multiple constraints."""
 
@@ -125,6 +183,16 @@ def build_constraint(config, tokenizer, mask_index: int) -> Optional[BaseConstra
         for w in words:
             banned_ids.extend(tokenizer.encode(w, add_special_tokens=False))
         return BannedTokensConstraint(banned_ids)
+
+    elif ctype == "toxicity":
+        return ToxicityConstraint(
+            diffusion_tokenizer=tokenizer,
+            classifier_name=getattr(
+                config.constraint, "classifier_name", "unitary/toxic-bert"
+            ),
+            threshold=getattr(config.constraint, "threshold", 0.5),
+            device=getattr(config.constraint, "classifier_device", "cpu"),
+        )
 
     elif ctype == "composed":
         subs = []
