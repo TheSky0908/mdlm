@@ -200,7 +200,26 @@ def _train_discriminator(config, logger, tokenizer):
   if constraint is None:
     raise ValueError('discriminator_train mode requires a constraint in config.')
 
-  train_ds, _ = dataloader.get_dataloaders(config, tokenizer)
+  jigsaw_csv = getattr(config.discriminator, 'jigsaw_csv_path', '')
+  if jigsaw_csv:
+    if not os.path.isabs(jigsaw_csv):
+      jigsaw_csv = os.path.join(hydra.utils.get_original_cwd(), jigsaw_csv)
+    threshold = getattr(config.constraint, 'threshold', 0.5)
+    jigsaw_ds = disc_lib.JigsawDataset(
+      csv_path=jigsaw_csv,
+      tokenizer=tokenizer,
+      max_length=config.model.length,
+      threshold=threshold,
+    )
+    train_ds = torch.utils.data.DataLoader(
+      jigsaw_ds,
+      batch_size=config.loader.batch_size,
+      shuffle=True,
+      num_workers=getattr(config.loader, 'num_workers', 4),
+      pin_memory=True,
+    )
+  else:
+    train_ds, _ = dataloader.get_dataloaders(config, tokenizer)
 
   disc = disc_lib.HDiscriminator(
     vocab_size=model.vocab_size,

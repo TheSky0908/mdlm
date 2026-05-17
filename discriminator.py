@@ -191,8 +191,11 @@ def train_discriminator(
             move_chance = t[:, None]                             # [B, 1]
             xt = diffusion.q_xt(x0, move_chance)                # [B, L]
 
-            # Constraint labels
-            labels = constraint.check(x0).float()               # [B]
+            # Constraint labels: use pre-computed labels if provided (e.g. Jigsaw)
+            if isinstance(batch, dict) and "label" in batch:
+                labels = batch["label"].to(device)
+            else:
+                labels = constraint.check(x0).float()           # [B]
 
             h = discriminator(xt, t)
             loss = discriminator_loss(h, labels)
@@ -232,6 +235,63 @@ def train_discriminator(
         print(f"[Discriminator] Saved to {save_path}")
 
     return discriminator
+
+
+class JigsawDataset(torch.utils.data.Dataset):
+    """
+    Jigsaw Toxic Comment CSV → (input_ids, label) pairs.
+
+    label = 1.0  non-toxic  (satisfies constraint toxicity < threshold)
+    label = 0.0  toxic      (violates constraint)
+
+    CSV must have columns: comment_text, toxic
+    """
+
+    def __init__(
+        self,
+        csv_path: str,
+        tokenizer,
+        max_length: int = 1024,
+        threshold: float = 0.5,
+    ):
+        import pandas as pd
+
+        df = pd.read_csv(csv_path, usecols=["comment_text", "toxic"])
+        df = df.dropna(subset=["comment_text", "toxic"])
+
+        self.texts = df["comment_text"].tolist()
+        # Jigsaw toxic column: 1=toxic, 0=clean
+        # label=1.0 means satisfies constraint (non-toxic)
+        self.labels = [
+            1.0 if row == 0 else 0.0
+            for row in df["toxic"].astype(int).tolist()
+        ]
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+        pos = sum(self.labels)
+        print(
+            f"[JigsawDataset] {len(self.texts)} samples  "
+            f"non-toxic={pos:.0f} ({100*pos/len(self.texts):.1f}%)  "
+            f"toxic={len(self.texts)-pos:.0f} "
+            f"({100*(1-pos/len(self.texts)):.1f}%)"
+        )
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        enc = self.tokenizer(
+            self.texts[idx],
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        return {
+            "input_ids": enc["input_ids"].squeeze(0),
+            "label": torch.tensor(self.labels[idx], dtype=torch.float),
+        }
 
 
 def load_discriminator(path: str, config, vocab_size: int) -> HDiscriminator:

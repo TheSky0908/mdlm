@@ -125,3 +125,4 @@ discriminator:
   topk: 50            # top-K candidates per masked position during sampling
   save_path: discriminator.pt
   load_path: ''        # set to load a pre-trained discriminator
+  jigsaw_csv_path: ''  # path to Jigsaw train.csv; if set, use Jigsaw instead of diffusion data
