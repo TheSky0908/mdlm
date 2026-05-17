@@ -274,6 +274,13 @@ def _constrained_sample_eval(config, logger, tokenizer):
 
   topk = getattr(getattr(config, 'discriminator', object()), 'topk', 50)
 
+  # Tokenize prefix text if provided
+  prefix_ids = None
+  prefix_text = getattr(config.sampling, 'prefix_text', '')
+  if prefix_text:
+    prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+    logger.info(f'Using prefix ({len(prefix_ids)} tokens): {prefix_text!r}')
+
   model.gen_ppl_metric.reset()
   all_samples = []
   for _ in range(config.sampling.num_sample_batches):
@@ -282,6 +289,7 @@ def _constrained_sample_eval(config, logger, tokenizer):
       constraint=constraint,
       discriminator=disc,
       topk=topk,
+      prefix_ids=prefix_ids,
     )
     texts = model.tokenizer.batch_decode(samples)
     all_samples.extend(texts)

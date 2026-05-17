@@ -111,6 +111,7 @@ def sample_fhs_constrained(
     constraint,
     discriminator: Optional[nn.Module],
     topk: int = 50,
+    prefix_ids: Optional[list] = None,
 ) -> Tensor:
     """
     FHS constrained 采样，与原始 restore_model_and_sample_first_hitting 流程完全对齐。
@@ -126,10 +127,19 @@ def sample_fhs_constrained(
 
     x = diffusion._sample_prior(batch_size, L).to(device)   # 全 MASK 初始化
     B = x.shape[0]
+
+    # 预填 prefix：直接写入前 k 个位置，FHS 只 unmask 剩余位置
+    prefix_len = 0
+    if prefix_ids:
+        prefix_len = len(prefix_ids)
+        prefix_tensor = torch.tensor(prefix_ids, device=device, dtype=x.dtype)
+        x[:, :prefix_len] = prefix_tensor.unsqueeze(0)      # 广播到整个 batch
+
+    L_unmask = L - prefix_len
     t = torch.ones(B, device=device)                         # t=1 对应全 MASK
 
-    for i in tqdm(range(L), desc="FHS sampling", unit="step"):
-        num_masked = L - i
+    for i in tqdm(range(L_unmask), desc="FHS sampling", unit="step"):
+        num_masked = L_unmask - i
 
         # ---- Step 1: 更新时间 ----
         # u ~ max of num_masked uniform draws = U^{1/num_masked}
@@ -180,6 +190,7 @@ def restore_and_sample_constrained(
     constraint=None,
     discriminator: Optional[nn.Module] = None,
     topk: int = 50,
+    prefix_ids: Optional[list] = None,
 ) -> Tensor:
     """加载 EMA 权重 → 约束 FHS 采样 → 还原权重。"""
     if diffusion.ema:
@@ -202,6 +213,7 @@ def restore_and_sample_constrained(
         constraint=constraint,
         discriminator=discriminator,
         topk=topk,
+        prefix_ids=prefix_ids,
     )
     elapsed = time.time() - t0
 

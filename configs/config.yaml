@@ -47,6 +47,7 @@ sampling:
   semi_ar: False
   stride_length: 1
   num_strides: 1
+  prefix_text: ''   # if set, pre-fill this text before FHS constrained sampling
 
 training:
   ema: 0.9999
