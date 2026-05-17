@@ -212,6 +212,8 @@ def _train_discriminator(config, logger, tokenizer):
   )
 
   save_path = getattr(config.discriminator, 'save_path', 'discriminator.pt')
+  if not os.path.isabs(save_path):
+    save_path = os.path.join(hydra.utils.get_original_cwd(), save_path)
   disc_lib.train_discriminator(
     discriminator=disc,
     diffusion=model,
@@ -239,6 +241,8 @@ def _constrained_sample_eval(config, logger, tokenizer):
   if disc_path is not None:
     disc_path = getattr(config.discriminator, 'load_path', None)
   if disc_path is not None and disc_path != '':
+    if not os.path.isabs(disc_path):
+      disc_path = os.path.join(hydra.utils.get_original_cwd(), disc_path)
     if not os.path.exists(disc_path):
       logger.warning(
         f'Discriminator file not found: {disc_path}. '
