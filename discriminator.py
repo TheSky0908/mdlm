@@ -21,6 +21,7 @@ import math
 import os
 from typing import Optional
 
+from tqdm.auto import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -172,50 +173,61 @@ def train_discriminator(
     discriminator.to(device).train()
     step = 0
     running_loss = 0.0
+    pbar = tqdm(total=max_steps, desc="Discriminator", unit="step")
 
-    for batch in train_dataloader:
-        if isinstance(batch, dict):
-            x0 = batch["input_ids"].to(device)
-        else:
-            x0 = batch[0].to(device)
+    try:
+        for batch in train_dataloader:
+            if isinstance(batch, dict):
+                x0 = batch["input_ids"].to(device)
+            else:
+                x0 = batch[0].to(device)
 
-        B = x0.shape[0]
+            B = x0.shape[0]
 
-        # Sample t ~ Uniform[eps, 1]
-        t = torch.rand(B, device=device) * (1 - eps) + eps  # [B]
+            # Sample t ~ Uniform[eps, 1]
+            t = torch.rand(B, device=device) * (1 - eps) + eps  # [B]
 
-        # Forward diffuse: mask each token independently with prob t
-        move_chance = t[:, None]                             # [B, 1]
-        xt = diffusion.q_xt(x0, move_chance)                # [B, L]
+            # Forward diffuse: mask each token independently with prob t
+            move_chance = t[:, None]                             # [B, 1]
+            xt = diffusion.q_xt(x0, move_chance)                # [B, L]
 
-        # Constraint labels
-        labels = constraint.check(x0).float()               # [B]
+            # Constraint labels
+            labels = constraint.check(x0).float()               # [B]
 
-        h = discriminator(xt, t)
-        loss = discriminator_loss(h, labels)
+            h = discriminator(xt, t)
+            loss = discriminator_loss(h, labels)
 
-        optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
-        optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
+            optimizer.step()
 
-        running_loss += loss.item()
-        step += 1
-
-        if step % log_every == 0:
-            avg = running_loss / log_every
-            running_loss = 0.0
+            loss_val = loss.item()
+            running_loss += loss_val
+            step += 1
             sat_frac = labels.mean().item()
-            print(
-                f"[Discriminator] step={step:6d}  loss={avg:.4f}"
-                f"  constraint_rate={sat_frac:.3f}"
-            )
 
-        if step >= max_steps:
-            break
+            if step % log_every == 0:
+                avg = running_loss / log_every
+                running_loss = 0.0
+            else:
+                avg = running_loss / (step % log_every)
+            pbar.set_postfix(
+                loss=f"{avg:.4f}",
+                constraint_rate=f"{sat_frac:.3f}",
+                refresh=False,
+            )
+            pbar.update(1)
+
+            if step >= max_steps:
+                break
+    finally:
+        pbar.close()
 
     if save_path is not None:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        parent = os.path.dirname(save_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         torch.save(discriminator.state_dict(), save_path)
         print(f"[Discriminator] Saved to {save_path}")
 
