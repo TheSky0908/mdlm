@@ -31,6 +31,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from torch import Tensor
+from tqdm.auto import tqdm
 
 from diffusion import _sample_categorical
 
@@ -127,7 +128,7 @@ def sample_fhs_constrained(
     B = x.shape[0]
     t = torch.ones(B, device=device)                         # t=1 对应全 MASK
 
-    for i in range(L):
+    for i in tqdm(range(L), desc="FHS sampling", unit="step"):
         num_masked = L - i
 
         # ---- Step 1: 更新时间 ----
