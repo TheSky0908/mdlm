@@ -149,8 +149,26 @@ def constrained_euler_update(
     return copy_flag * x + (1 - copy_flag) * sampled
 
 
+def _sample_prior_with_prefix(diffusion, batch_size: int, length: int, prefix_ids=None) -> Tensor:
+    x = diffusion._sample_prior(batch_size, length).to(diffusion.device)
+    if prefix_ids:
+        prefix_len = min(len(prefix_ids), length)
+        prefix = torch.tensor(
+            prefix_ids[:prefix_len],
+            device=diffusion.device,
+            dtype=x.dtype,
+        )
+        x[:, :prefix_len] = prefix[None]
+    return x
+
+
 @torch.no_grad()
-def sample_euler(diffusion, num_steps: int | None = None, eps: float = 1e-5) -> Tensor:
+def sample_euler(
+    diffusion,
+    num_steps: int | None = None,
+    eps: float = 1e-5,
+    prefix_ids=None,
+) -> Tensor:
     """Generate unconditional samples with reverse-generator Euler sampling."""
     batch_size = diffusion.config.loader.eval_batch_size
     length = diffusion.config.model.length
@@ -159,7 +177,7 @@ def sample_euler(diffusion, num_steps: int | None = None, eps: float = 1e-5) -> 
     if num_steps is None:
         num_steps = diffusion.config.sampling.steps
 
-    x = diffusion._sample_prior(batch_size, length).to(device)
+    x = _sample_prior_with_prefix(diffusion, batch_size, length, prefix_ids)
     timesteps = torch.linspace(1, eps, num_steps + 1, device=device)
     dt = (1 - eps) / num_steps
 
@@ -182,6 +200,7 @@ def sample_constrained_euler(
     topk: int = 50,
     num_steps: int | None = None,
     eps: float = 1e-5,
+    prefix_ids=None,
 ) -> Tensor:
     """Generate samples with the h-transform constrained Euler sampler."""
     batch_size = diffusion.config.loader.eval_batch_size
@@ -191,7 +210,7 @@ def sample_constrained_euler(
     if num_steps is None:
         num_steps = diffusion.config.sampling.steps
 
-    x = diffusion._sample_prior(batch_size, length).to(device)
+    x = _sample_prior_with_prefix(diffusion, batch_size, length, prefix_ids)
     timesteps = torch.linspace(1, eps, num_steps + 1, device=device)
     dt = (1 - eps) / num_steps
 
@@ -218,6 +237,7 @@ def restore_and_sample_euler(
     diffusion,
     num_steps: int | None = None,
     eps: float = 1e-5,
+    prefix_ids=None,
 ) -> Tensor:
     """Run Euler sampling with the model's EMA weights, mirroring diffusion.py."""
     if diffusion.ema:
@@ -232,7 +252,12 @@ def restore_and_sample_euler(
     diffusion.noise.eval()
 
     start_time = time.time()
-    samples = sample_euler(diffusion, num_steps=num_steps, eps=eps)
+    samples = sample_euler(
+        diffusion,
+        num_steps=num_steps,
+        eps=eps,
+        prefix_ids=prefix_ids,
+    )
     print("Elapsed time: ", time.time() - start_time)
 
     if diffusion.ema:
@@ -251,6 +276,7 @@ def restore_and_sample_constrained_euler(
     topk: int = 50,
     num_steps: int | None = None,
     eps: float = 1e-5,
+    prefix_ids=None,
 ) -> Tensor:
     """Run constrained Euler sampling with EMA weights."""
     if diffusion.ema:
@@ -273,6 +299,7 @@ def restore_and_sample_constrained_euler(
         topk=topk,
         num_steps=num_steps,
         eps=eps,
+        prefix_ids=prefix_ids,
     )
     print("Elapsed time: ", time.time() - start_time)
 
@@ -327,6 +354,12 @@ def main(config):
         if disc is not None:
             logger.info("Using discriminator-guided constrained Euler.")
 
+    prefix_ids = None
+    prefix_text = getattr(config.sampling, "prefix_text", "")
+    if prefix_text:
+        prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+        logger.info(f"Using prefix ({len(prefix_ids)} tokens): {prefix_text!r}")
+
     model.gen_ppl_metric.reset()
     text_samples = []
     for _ in range(config.sampling.num_sample_batches):
@@ -336,9 +369,14 @@ def main(config):
                 discriminator=disc,
                 topk=topk,
                 num_steps=config.sampling.steps,
+                prefix_ids=prefix_ids,
             )
         else:
-            samples = restore_and_sample_euler(model, num_steps=config.sampling.steps)
+            samples = restore_and_sample_euler(
+                model,
+                num_steps=config.sampling.steps,
+                prefix_ids=prefix_ids,
+            )
         texts = model.tokenizer.batch_decode(samples)
         text_samples.extend(texts)
         model.compute_generative_perplexity(texts)
