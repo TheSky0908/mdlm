@@ -46,7 +46,6 @@ def euler_update(diffusion, x: Tensor, t: Tensor, dt: float) -> Tensor:
     positions are absorbing in the reverse sampler and are copied through.
     """
     sigma_t, dsigma_dt = diffusion.noise(t)
-    sigma_t = _as_vector(sigma_t)
     dsigma_dt = _as_vector(dsigma_dt)
 
     score = diffusion.get_score(x, sigma_t)
@@ -125,7 +124,6 @@ def constrained_euler_update(
         R_new(x, xtilde) = R_rev(x, xtilde) * h(xtilde, t) / h(x, t).
     """
     sigma_t, dsigma_dt = diffusion.noise(t)
-    sigma_t = _as_vector(sigma_t)
     dsigma_dt = _as_vector(dsigma_dt)
 
     score = diffusion.get_score(x, sigma_t)
