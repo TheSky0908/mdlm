@@ -16,6 +16,7 @@ import utils
 import constraints as constraint_lib
 import discriminator as disc_lib
 import fhs_constrained
+import rtp_prefixes
 ## end of Claude modifications
 
 omegaconf.OmegaConf.register_new_resolver(
@@ -265,7 +266,7 @@ def _constrained_sample_eval(config, logger, tokenizer):
     if not os.path.exists(disc_path):
       logger.warning(
         f'Discriminator file not found: {disc_path}. '
-        f'Falling back to analytical constraint only.'
+        f'Falling back to unconditional sampling.'
       )
     else:
       disc = disc_lib.load_discriminator(disc_path, config, model.vocab_size)
@@ -274,26 +275,43 @@ def _constrained_sample_eval(config, logger, tokenizer):
 
   topk = getattr(getattr(config, 'discriminator', object()), 'topk', 50)
 
-  # Tokenize prefix text if provided
-  prefix_ids = None
-  prefix_text = getattr(config.sampling, 'prefix_text', '')
-  if prefix_text:
-    prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
-    logger.info(f'Using prefix ({len(prefix_ids)} tokens): {prefix_text!r}')
+  prefix_texts = rtp_prefixes.load_prefixes(
+    config=config,
+    tokenizer=tokenizer,
+    model_length=config.model.length,
+    logger=logger,
+  )
 
   model.gen_ppl_metric.reset()
   all_samples = []
-  for _ in range(config.sampling.num_sample_batches):
-    samples = fhs_constrained.restore_and_sample_constrained(
-      diffusion=model,
-      constraint=constraint,
-      discriminator=disc,
-      topk=topk,
-      prefix_ids=prefix_ids,
-    )
-    texts = model.tokenizer.batch_decode(samples)
-    all_samples.extend(texts)
-    model.compute_generative_perplexity(texts)
+  for prefix_text in prefix_texts:
+    prefix_ids = None
+    if prefix_text:
+      prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+      logger.info(f'Using prefix ({len(prefix_ids)} tokens): {prefix_text!r}')
+
+    for _ in range(config.sampling.num_sample_batches):
+      if disc is None:
+        samples = model.restore_model_and_sample(
+          num_steps=config.sampling.steps)
+        if prefix_ids:
+          prefix_tensor = torch.tensor(
+            prefix_ids[:config.model.length],
+            device=samples.device,
+            dtype=samples.dtype,
+          )
+          samples[:, :prefix_tensor.shape[0]] = prefix_tensor[None]
+      else:
+        samples = fhs_constrained.restore_and_sample_constrained(
+          diffusion=model,
+          constraint=constraint,
+          discriminator=disc,
+          topk=topk,
+          prefix_ids=prefix_ids,
+        )
+      texts = model.tokenizer.batch_decode(samples)
+      all_samples.extend(texts)
+      model.compute_generative_perplexity(texts)
 
   print('Constrained samples:')
   for t in all_samples[:config.sampling.num_sample_log]:
